@@ -38,6 +38,11 @@ triton = [
     "triton @ https://github.com/woct0rdho/triton-windows/releases/download/v3.2.0-windows.post10/triton-3.2.0-cp311-cp311-win_amd64.whl ; python_version=='3.11' and platform_system == 'Windows'",
     "triton @ https://github.com/woct0rdho/triton-windows/releases/download/v3.2.0-windows.post10/triton-3.2.0-cp312-cp312-win_amd64.whl ; python_version=='3.12' and platform_system == 'Windows'"
 ]
+multi-gpu = [
+    "accelerate>=0.34.1",
+    "deepspeed>=0.10.0",
+    "packaging",
+]
 
 windows=[
     "unsloth_zoo>=2025.2.7",

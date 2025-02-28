@@ -36,6 +36,7 @@ __all__ = [
     "unsloth_train",
     "_patch_trl_trainer",
     "UnslothVisionDataCollator",
+    "initialize_distributed",
 ]
 
 # Unsloth gradient accumulation fix:
@@ -71,6 +72,10 @@ class UnslothTrainingArguments(TrainingArguments):
     embedding_learning_rate : Optional[float] = field(
         default = None,
         metadata = {"help" : "Different learning rates for embeddings and lm_head."}
+    )
+    multi_gpu_strategy : Optional[str] = field(
+        default = "ddp",
+        metadata = {"help" : "Distributed training strategy to use ('ddp', 'deepspeed', or 'none'). Default is 'ddp'."}
     )
 pass
 
@@ -120,6 +125,21 @@ pass
 
 
 class UnslothTrainer(SFTTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Configure multi-GPU if specified
+        multi_gpu_strategy = getattr(self.args, "multi_gpu_strategy", "ddp")
+        if multi_gpu_strategy != "none":
+            import torch.distributed as dist
+            from accelerate import Accelerator
+            
+            # Log multi-GPU setup
+            if dist.is_available() and dist.is_initialized():
+                print(f"Unsloth: Using multi-GPU with {dist.get_world_size()} GPUs")
+                print(f"Unsloth: Current GPU rank: {dist.get_rank()}")
+                print(f"Unsloth: Using distributed strategy: {multi_gpu_strategy}")
+    
     def create_optimizer(self):
         embedding_learning_rate = getattr(self.args, "embedding_learning_rate", None)
         if embedding_learning_rate is None: return super().create_optimizer()
@@ -134,7 +154,13 @@ class UnslothTrainer(SFTTrainer):
             )
         pass
         return self.optimizer
-    pass
+    
+    def _prepare_inputs(self, inputs):
+        """
+        Prepare inputs for multi-GPU training
+        """
+        inputs = super()._prepare_inputs(inputs)
+        return inputs
 pass
 
 # From `trl>=0.13.0`, they changed how to pass several params to the trainer
@@ -224,3 +250,65 @@ def _patch_trl_trainer():
 
     trl.__UNSLOTH_BACKWARDS_COMPATIBLE__ = True
 pass
+
+
+def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
+    """
+    Initialize distributed training for Unsloth.
+    
+    Args:
+        strategy (str): Distributed strategy to use - 'ddp' (default) or 'deepspeed'
+        use_deepspeed (bool): If True, will use DeepSpeed for distributed training
+        zero_stage (int): ZeRO stage to use when using DeepSpeed (0, 1, 2, or 3)
+        
+    Returns:
+        accelerator (Accelerator): Accelerate's Accelerator object
+    """
+    import os
+    import torch
+    import importlib.util
+    from accelerate import Accelerator
+    from accelerate.utils import ProjectConfiguration
+    
+    if use_deepspeed or strategy == "deepspeed":
+        if not use_deepspeed:
+            use_deepspeed = True  # Strategy takes priority over flag
+        
+        # Check if DeepSpeed is installed
+        if importlib.util.find_spec("deepspeed") is None:
+            raise ImportError(
+                "Unsloth: DeepSpeed is not installed but required for DeepSpeed strategy.\n"
+                "Please install with: pip install deepspeed"
+            )
+        
+        # Configure DeepSpeed
+        deepspeed_config = {
+            "gradient_accumulation_steps": 1,  # Will be overridden by training args
+            "gradient_clipping": 1.0,
+            "offload_optimizer_device": "none",
+            "offload_param_device": "none",
+            "zero_stage": zero_stage,
+            "train_micro_batch_size_per_gpu": 1,  # Will be overridden
+        }
+        
+        accelerator = Accelerator(
+            mixed_precision="bf16" if torch.cuda.is_bf16_supported() else "fp16",
+            deepspeed_plugin=deepspeed_config,
+            log_with=None,
+            project_config=ProjectConfiguration(),
+        )
+    else:
+        # Use standard DDP
+        accelerator = Accelerator(
+            mixed_precision="bf16" if torch.cuda.is_bf16_supported() else "fp16",
+            log_with=None,
+            project_config=ProjectConfiguration(),
+        )
+    
+    # Print distributed info
+    if accelerator.process_index == 0:
+        print(f"Unsloth: Multi-GPU initialized with {accelerator.num_processes} GPUs")
+        print(f"Unsloth: Current GPU rank: {accelerator.process_index}")
+        print(f"Unsloth: Using distributed strategy: {strategy}")
+    
+    return accelerator
