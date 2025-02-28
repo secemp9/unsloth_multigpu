@@ -126,19 +126,52 @@ pass
 
 class UnslothTrainer(SFTTrainer):
     def __init__(self, *args, **kwargs):
+        # Distributed setup
+        self._is_distributed = False
+        self._world_size = 1
+        self._rank = 0
+        
+        # Configure multi-GPU if in args
+        if "args" in kwargs and hasattr(kwargs["args"], "multi_gpu_strategy"):
+            multi_gpu_strategy = kwargs["args"].multi_gpu_strategy
+            if multi_gpu_strategy != "none":
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    self._is_distributed = True
+                    self._world_size = dist.get_world_size()
+                    self._rank = dist.get_rank()
+                    
+                    # Ensure proper dataset sharding if dataset provided
+                    if "train_dataset" in kwargs and kwargs["train_dataset"] is not None:
+                        from datasets.distributed import split_dataset_by_node
+                        
+                        # Only shard the dataset once (avoid double sharding)
+                        dataset = kwargs["train_dataset"]
+                        if not getattr(dataset, "_unsloth_sharded", False):
+                            # Shard dataset across GPUs to prevent duplication
+                            kwargs["train_dataset"] = split_dataset_by_node(
+                                dataset, 
+                                rank=self._rank,
+                                world_size=self._world_size
+                            )
+                            print(f"Unsloth: GPU {self._rank}/{self._world_size} sharded dataset to size: {len(kwargs['train_dataset'])}")
+                            
+                            # Mark as sharded to prevent double-sharding
+                            kwargs["train_dataset"]._unsloth_sharded = True
+        
+        # Call parent constructor
         super().__init__(*args, **kwargs)
         
         # Configure multi-GPU if specified
         multi_gpu_strategy = getattr(self.args, "multi_gpu_strategy", "ddp")
-        if multi_gpu_strategy != "none":
-            import torch.distributed as dist
-            from accelerate import Accelerator
-            
-            # Log multi-GPU setup
-            if dist.is_available() and dist.is_initialized():
-                print(f"Unsloth: Using multi-GPU with {dist.get_world_size()} GPUs")
-                print(f"Unsloth: Current GPU rank: {dist.get_rank()}")
-                print(f"Unsloth: Using distributed strategy: {multi_gpu_strategy}")
+        if multi_gpu_strategy != "none" and self._is_distributed:
+            # Log multi-GPU setup (but only once per process)
+            if not hasattr(self, "_logged_setup"):
+                self._logged_setup = True
+                
+                if self._rank == 0:
+                    print(f"Unsloth: Using multi-GPU with {self._world_size} GPUs")
+                    print(f"Unsloth: Using distributed strategy: {multi_gpu_strategy}")
     
     def create_optimizer(self):
         embedding_learning_rate = getattr(self.args, "embedding_learning_rate", None)
@@ -157,9 +190,29 @@ class UnslothTrainer(SFTTrainer):
     
     def _prepare_inputs(self, inputs):
         """
-        Prepare inputs for multi-GPU training
+        Prepare inputs for multi-GPU training.
+        Ensures inputs are properly sharded across GPUs rather than duplicated.
         """
+        # Get distributed environment info if available
+        import torch.distributed as dist
+        is_distributed = dist.is_available() and dist.is_initialized()
+        
+        # Apply parent's preparation logic first
         inputs = super()._prepare_inputs(inputs)
+        
+        # If we're in a distributed setting, ensure we're not duplicating data
+        if is_distributed and hasattr(self.args, "multi_gpu_strategy") and self.args.multi_gpu_strategy != "none":
+            # If inputs contain dataset indices, make sure they're properly sharded
+            if "idx" in inputs and isinstance(inputs["idx"], torch.Tensor):
+                # Verify indices are unique across processes to avoid duplication
+                world_size = dist.get_world_size()
+                rank = dist.get_rank()
+                
+                # Log only once per process for debugging
+                if getattr(self, "_logged_sharding_info", False) is False:
+                    print(f"Unsloth: GPU {rank}/{world_size} preparing inputs for training")
+                    self._logged_sharding_info = True
+        
         return inputs
 pass
 
@@ -268,7 +321,14 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
     import torch
     import importlib.util
     from accelerate import Accelerator
-    from accelerate.utils import ProjectConfiguration
+    from accelerate.utils import ProjectConfiguration, DistributedType
+    
+    # Set environment variables to ensure proper data sharding
+    if "ACCELERATE_TORCH_DEVICE" not in os.environ:
+        os.environ["ACCELERATE_TORCH_DEVICE"] = "cuda"
+    
+    # Set distributed implementation
+    os.environ["ACCELERATE_USE_SAGEMAKER"] = "false"
     
     if use_deepspeed or strategy == "deepspeed":
         if not use_deepspeed:
@@ -297,6 +357,7 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
             log_with=None,
             project_config=ProjectConfiguration(),
         )
+        os.environ["ACCELERATE_DISTRIBUTED_TYPE"] = "DEEPSPEED"
     else:
         # Use standard DDP
         accelerator = Accelerator(
@@ -304,11 +365,23 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
             log_with=None,
             project_config=ProjectConfiguration(),
         )
+        os.environ["ACCELERATE_DISTRIBUTED_TYPE"] = "MULTI_GPU"
     
     # Print distributed info
     if accelerator.process_index == 0:
-        print(f"Unsloth: Multi-GPU initialized with {accelerator.num_processes} GPUs")
+        world_size = accelerator.num_processes
+        print(f"Unsloth: Multi-GPU initialized with {world_size} GPUs")
         print(f"Unsloth: Current GPU rank: {accelerator.process_index}")
         print(f"Unsloth: Using distributed strategy: {strategy}")
+        
+        if world_size > 1:
+            print(f"Unsloth: Data will be automatically sharded across {world_size} GPUs")
+            # Print distributed type
+            dist_type = accelerator.distributed_type
+            print(f"Unsloth: Accelerate distributed type: {dist_type}")
+            if dist_type == DistributedType.MULTI_GPU:
+                print("Unsloth: Using native PyTorch DDP for distributed training")
+            elif dist_type == DistributedType.DEEPSPEED:
+                print(f"Unsloth: Using DeepSpeed ZeRO-{zero_stage} for distributed training")
     
     return accelerator

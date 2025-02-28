@@ -36,6 +36,14 @@ from unsloth import (
     UnslothTrainingArguments,
 )
 from datasets import load_dataset
+import torch.distributed as dist
+
+# Get distributed rank info
+rank = 0
+world_size = 1
+if dist.is_available() and dist.is_initialized():
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
 # Load model, enable 4-bit quantization for reduced VRAM
 model, tokenizer = FastLanguageModel.from_pretrained(
@@ -59,6 +67,8 @@ model = FastLanguageModel.get_peft_model(
 
 # Load sample dataset
 dataset = load_dataset("Abirate/english_quotes", split="train")
+if rank == 0:
+    print(f"Full dataset size: {len(dataset)}")
 
 # Prepare data for training
 def preprocess_function(examples):
@@ -82,9 +92,11 @@ training_args = UnslothTrainingArguments(
     weight_decay=0.01,
     remove_unused_columns=False,
     multi_gpu_strategy="ddp",  # Tell Unsloth we're using DDP
+    dataloader_num_workers=max(1, os.cpu_count() // world_size // 2),  # Optimal workers per GPU
+    seed=42,  # Set fixed seed to ensure proper sharding
 )
 
-# Create trainer
+# Create trainer - dataset will be automatically sharded
 trainer = UnslothTrainer(
     model=model,
     tokenizer=tokenizer,
@@ -94,12 +106,16 @@ trainer = UnslothTrainer(
                                'attention_mask': torch.stack([f["attention_mask"] for f in data])},
 )
 
-print(f"Training on {accelerator.num_processes} GPUs")
+if rank == 0:
+    print(f"Training on {world_size} GPUs")
+    
 # Train the model
 trainer.train()
 
 # Save the model on the primary process only
 if accelerator.is_main_process:
     model.save_pretrained("./final_model")
+    print("Model saved to ./final_model")
     
-print("Multi-GPU training complete!")
+if rank == 0:
+    print("Multi-GPU training complete!")
