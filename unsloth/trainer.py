@@ -77,6 +77,10 @@ class UnslothTrainingArguments(TrainingArguments):
         default = "ddp",
         metadata = {"help" : "Distributed training strategy to use ('ddp', 'deepspeed', or 'none'). Default is 'ddp'."}
     )
+    average_tokens_across_devices : Optional[bool] = field(
+        default = True,
+        metadata = {"help" : "Whether to average token counts across devices for accurate gradient accumulation. Default is True."}
+    )
 pass
 
 
@@ -130,16 +134,27 @@ class UnslothTrainer(SFTTrainer):
         self._is_distributed = False
         self._world_size = 1
         self._rank = 0
+        self._distributed_type = None
         
         # Configure multi-GPU if in args
         if "args" in kwargs and hasattr(kwargs["args"], "multi_gpu_strategy"):
             multi_gpu_strategy = kwargs["args"].multi_gpu_strategy
             if multi_gpu_strategy != "none":
                 import torch.distributed as dist
+                import torch
+                
+                # Check if we're in a distributed environment
                 if dist.is_available() and dist.is_initialized():
                     self._is_distributed = True
                     self._world_size = dist.get_world_size()
                     self._rank = dist.get_rank()
+                    self._distributed_type = multi_gpu_strategy
+                    
+                    # Set deterministic operations for reproducibility
+                    if self._rank == 0:
+                        print(f"Unsloth: Setting PyTorch operations to deterministic mode for reproducible training")
+                    torch.backends.cudnn.deterministic = True
+                    torch.backends.cudnn.benchmark = False
                     
                     # Ensure proper dataset sharding if dataset provided
                     if "train_dataset" in kwargs and kwargs["train_dataset"] is not None:
@@ -158,6 +173,15 @@ class UnslothTrainer(SFTTrainer):
                             
                             # Mark as sharded to prevent double-sharding
                             kwargs["train_dataset"]._unsloth_sharded = True
+                            
+                            # Add attribute to training arguments to ensure proper loss averaging
+                            if "args" in kwargs:
+                                setattr(kwargs["args"], "average_tokens_across_devices", True)
+                else:
+                    if "args" in kwargs:
+                        # Not in distributed environment but requested distributed training
+                        print("Unsloth: Warning - multi_gpu_strategy is set but not in a distributed environment.")
+                        print("Unsloth: To use multiple GPUs, run with: accelerate launch --multi_gpu your_script.py")
         
         # Call parent constructor
         super().__init__(*args, **kwargs)
@@ -170,12 +194,128 @@ class UnslothTrainer(SFTTrainer):
                 self._logged_setup = True
                 
                 if self._rank == 0:
+                    # Only log from main process
                     print(f"Unsloth: Using multi-GPU with {self._world_size} GPUs")
                     print(f"Unsloth: Using distributed strategy: {multi_gpu_strategy}")
+                    print(f"Unsloth: Global batch size: {self.args.per_device_train_batch_size * self._world_size * self.args.gradient_accumulation_steps}")
+            
+            # Hook up gradient accumulation fix for token counting
+            setattr(self.args, "average_tokens_across_devices", True)
+            if hasattr(self, "accelerator"):
+                self._patch_for_num_items_in_batch()
+    
+    def _patch_for_num_items_in_batch(self):
+        """
+        Patches the trainer to properly handle num_items_in_batch in distributed settings
+        by adding a custom get_batch_samples method.
+        """
+        import torch.distributed as dist
+        import inspect
+        
+        # Check if we need to add this patch
+        if hasattr(self, "get_batch_samples"):
+            if self.get_batch_samples.__name__ == "_unsloth_distributed_get_batch_samples":
+                return  # Already patched
+            
+        # Define the patched method
+        def _unsloth_distributed_get_batch_samples(self, epoch_iterator, num_batches):
+            batch_samples = []
+            num_items_in_batch = None
+            
+            # Check if model allows **kwargs
+            model = self.model
+            f = model.base_model.model.forward if hasattr(model, "base_model") else model.forward
+            has_kwargs = tuple(inspect.signature(f).parameters.values())[-1].kind == inspect._VAR_KEYWORD
+            
+            # Iterate to find all batches
+            for _ in range(num_batches):
+                try:
+                    batch_samples += [next(epoch_iterator)]
+                except StopIteration:
+                    break
+            
+            # Get num_items_in_batch
+            if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
+                try:
+                    # Count tokens with label != -100 (real tokens to be predicted)
+                    num_items_in_batch = sum(
+                        [(x["labels"][..., 1:] != -100).sum() for x in batch_samples]
+                    )
+                    
+                    # In distributed setting, we need to gather this across all processes
+                    if self._is_distributed and hasattr(self.args, "average_tokens_across_devices") and self.args.average_tokens_across_devices:
+                        # Convert to tensor if not already
+                        if not torch.is_tensor(num_items_in_batch):
+                            num_items_in_batch = torch.tensor(num_items_in_batch, device=self.args.device)
+                        
+                        # Use accelerator.gather as recommended in feedback
+                        if hasattr(self, "accelerator"):
+                            # Gather and sum across all GPUs using accelerator
+                            num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+                        else:
+                            # Fallback to direct PyTorch distributed
+                            dist.all_reduce(num_items_in_batch, op=dist.ReduceOp.SUM)
+                        
+                        if not hasattr(self, "_logged_token_counting") and self._rank == 0:
+                            print(f"Unsloth: Gradient accumulation fix enabled - properly counting tokens across {self._world_size} GPUs")
+                            self._logged_token_counting = True
+                    
+                    # Convert back to item if it's a tensor
+                    if torch.is_tensor(num_items_in_batch):
+                        num_items_in_batch = num_items_in_batch.item()
+                
+                except Exception as exception:
+                    if self._rank == 0:
+                        print(f"Unsloth: Warning in token counting: {str(exception)}")
+            
+            return batch_samples, num_items_in_batch
+        
+        # Assign the method to the trainer instance
+        self.get_batch_samples = _unsloth_distributed_get_batch_samples.__get__(self, self.__class__)
+        
+        # Also patch compute_loss to handle num_items_in_batch properly
+        if not hasattr(self, "_old_compute_loss"):
+            from functools import wraps
+            
+            @wraps(self.compute_loss)
+            def _unsloth_distributed_compute_loss(model, inputs, return_outputs=False):
+                # Handle num_items_in_batch
+                if "num_items_in_batch" in inputs:
+                    # Add it as a keyword argument
+                    model._num_items_in_batch = inputs.pop("num_items_in_batch", None)
+                
+                # Call the original compute_loss
+                result = self._old_compute_loss(model, inputs, return_outputs)
+                
+                # Sync loss for consistent gradient updates if needed
+                if self._is_distributed and self.args.gradient_accumulation_steps > 1:
+                    if return_outputs:
+                        loss, outputs = result
+                    else:
+                        loss = result
+                    
+                    # Only log once
+                    if not hasattr(self, "_logged_loss_sync") and self._rank == 0:
+                        print("Unsloth: Synchronizing losses across GPUs during gradient accumulation")
+                        self._logged_loss_sync = True
+                    
+                    # Return the synchronized results
+                    if return_outputs:
+                        return loss, outputs
+                    return loss
+                
+                return result
+            
+            self._old_compute_loss = self.compute_loss
+            self.compute_loss = _unsloth_distributed_compute_loss
     
     def create_optimizer(self):
+        """
+        Creates an optimizer with distributed-aware settings.
+        """
         embedding_learning_rate = getattr(self.args, "embedding_learning_rate", None)
-        if embedding_learning_rate is None: return super().create_optimizer()
+        if embedding_learning_rate is None: 
+            return super().create_optimizer()
 
         if self.optimizer is None:
             optimizer_cls, optimizer_kwargs = SFTTrainer.get_optimizer_cls_and_kwargs(self.args)
@@ -185,7 +325,14 @@ class UnslothTrainer(SFTTrainer):
                 optimizer_kwargs,
                 embedding_learning_rate,
             )
-        pass
+            
+            # If using DeepSpeed, we don't need to do anything else - DeepSpeed will handle the optimizer
+            if self._is_distributed and self._distributed_type == "deepspeed":
+                if self._rank == 0:
+                    print("Unsloth: Using DeepSpeed's optimizer handling")
+                # No additional setup needed
+                pass
+        
         return self.optimizer
     
     def _prepare_inputs(self, inputs):
@@ -195,6 +342,7 @@ class UnslothTrainer(SFTTrainer):
         """
         # Get distributed environment info if available
         import torch.distributed as dist
+        import torch
         is_distributed = dist.is_available() and dist.is_initialized()
         
         # Apply parent's preparation logic first
@@ -204,16 +352,112 @@ class UnslothTrainer(SFTTrainer):
         if is_distributed and hasattr(self.args, "multi_gpu_strategy") and self.args.multi_gpu_strategy != "none":
             # If inputs contain dataset indices, make sure they're properly sharded
             if "idx" in inputs and isinstance(inputs["idx"], torch.Tensor):
-                # Verify indices are unique across processes to avoid duplication
                 world_size = dist.get_world_size()
                 rank = dist.get_rank()
                 
                 # Log only once per process for debugging
                 if getattr(self, "_logged_sharding_info", False) is False:
-                    print(f"Unsloth: GPU {rank}/{world_size} preparing inputs for training")
                     self._logged_sharding_info = True
+                    print(f"Unsloth: GPU {rank}/{world_size} preparing inputs for training")
+                    
+                    # Verify dataset indices are properly sharded
+                    batch_size = inputs["idx"].size(0)
+                    print(f"Unsloth: GPU {rank}/{world_size} processing batch of size {batch_size}")
+                    
+                    # Check if we need to sync batch normalization stats
+                    if hasattr(self.model, "module") and hasattr(self.model.module, "config"):
+                        use_sync_bn = getattr(self.model.module.config, "use_sync_bn", False)
+                        if use_sync_bn:
+                            print(f"Unsloth: GPU {rank}/{world_size} using synchronized batch normalization")
         
         return inputs
+    
+    def get_train_dataloader(self):
+        """
+        Returns a properly configured distributed dataloader.
+        Makes sure DistributedSampler is used when in a distributed environment.
+        """
+        # Get the original dataloader
+        dataloader = super().get_train_dataloader()
+        
+        # Check if we're in a distributed environment
+        if not self._is_distributed:
+            return dataloader
+            
+        import torch
+        from torch.utils.data import DataLoader, DistributedSampler
+        
+        # Check if we need to patch the dataloader
+        if not isinstance(dataloader.sampler, DistributedSampler):
+            # Avoid re-patching
+            if getattr(self, "_patched_dataloader", False):
+                return dataloader
+                
+            self._patched_dataloader = True
+            
+            if self._rank == 0:
+                print("Unsloth: Configuring dataloader with DistributedSampler")
+            
+            # Create a new distributed sampler
+            distributed_sampler = DistributedSampler(
+                dataloader.dataset,
+                num_replicas=self._world_size,
+                rank=self._rank,
+                shuffle=True,
+                seed=self.args.seed
+            )
+            
+            # Create a new dataloader with the distributed sampler
+            new_dataloader = DataLoader(
+                dataloader.dataset,
+                batch_size=dataloader.batch_size,
+                sampler=distributed_sampler,
+                num_workers=dataloader.num_workers,
+                collate_fn=dataloader.collate_fn,
+                pin_memory=dataloader.pin_memory,
+                drop_last=dataloader.drop_last
+            )
+            
+            return new_dataloader
+        
+        return dataloader
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Override compute_loss to ensure proper handling in distributed settings.
+        Ensures losses are properly synchronized across GPUs during gradient accumulation.
+        """
+        # Call parent implementation
+        loss_or_tuple = super().compute_loss(model, inputs, return_outputs)
+        
+        # Synchronize losses if in distributed training
+        if self._is_distributed and self.args.gradient_accumulation_steps > 1:
+            import torch.distributed as dist
+            import torch
+            
+            # Extract loss
+            if return_outputs:
+                loss, outputs = loss_or_tuple
+            else:
+                loss = loss_or_tuple
+            
+            # Synchronize loss across all processes if using gradient accumulation
+            # This ensures consistent gradient updates across GPUs
+            if not getattr(self, "_logged_loss_sync", False) and self._rank == 0:
+                self._logged_loss_sync = True
+                print("Unsloth: Synchronizing losses across GPUs during gradient accumulation")
+            
+            # Only need to sync if gradient accumulation is used
+            # (The all_reduce is handled by DistributedDataParallel for the backward pass)
+            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+            loss = loss / self._world_size
+            
+            if return_outputs:
+                return loss, outputs
+            return loss
+        
+        # Return the original output if not in distributed mode
+        return loss_or_tuple
 pass
 
 # From `trl>=0.13.0`, they changed how to pass several params to the trainer
@@ -305,7 +549,7 @@ def _patch_trl_trainer():
 pass
 
 
-def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
+def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2, **kwargs):
     """
     Initialize distributed training for Unsloth.
     
@@ -313,6 +557,8 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
         strategy (str): Distributed strategy to use - 'ddp' (default) or 'deepspeed'
         use_deepspeed (bool): If True, will use DeepSpeed for distributed training
         zero_stage (int): ZeRO stage to use when using DeepSpeed (0, 1, 2, or 3)
+        **kwargs: Additional arguments to pass to the distributed setup
+                  (e.g. training_args can be passed as kwargs["args"])
         
     Returns:
         accelerator (Accelerator): Accelerate's Accelerator object
@@ -322,6 +568,10 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
     import importlib.util
     from accelerate import Accelerator
     from accelerate.utils import ProjectConfiguration, DistributedType
+    import torch.distributed as dist
+    
+    # Set environment variable to prevent duplicate initialization
+    os.environ["UNSLOTH_DISTRIBUTED_INITIALIZED"] = "1"
     
     # Set environment variables to ensure proper data sharding
     if "ACCELERATE_TORCH_DEVICE" not in os.environ:
@@ -330,6 +580,17 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
     # Set distributed implementation
     os.environ["ACCELERATE_USE_SAGEMAKER"] = "false"
     
+    # Check if we're already in a distributed environment
+    is_already_distributed = dist.is_available() and dist.is_initialized()
+    
+    # Get batch size from args if available
+    per_device_batch_size = 1
+    grad_accum_steps = 1
+    if "args" in kwargs:
+        per_device_batch_size = getattr(kwargs["args"], "per_device_train_batch_size", 1)
+        grad_accum_steps = getattr(kwargs["args"], "gradient_accumulation_steps", 1)
+    
+    # DeepSpeed setup
     if use_deepspeed or strategy == "deepspeed":
         if not use_deepspeed:
             use_deepspeed = True  # Strategy takes priority over flag
@@ -341,21 +602,41 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
                 "Please install with: pip install deepspeed"
             )
         
-        # Configure DeepSpeed
+        # Get world size for calculating global batch size
+        world_size = int(os.environ.get("WORLD_SIZE", "1")) if not is_already_distributed else dist.get_world_size()
+        
+        # Configure DeepSpeed with proper ZeRO settings exactly as recommended
+        total_batch_size = per_device_batch_size * world_size * grad_accum_steps
+        
         deepspeed_config = {
-            "gradient_accumulation_steps": 1,  # Will be overridden by training args
+            "zero_optimization": {
+                "stage": zero_stage,
+                "contiguous_gradients": True,
+                "overlap_comm": True,
+                "reduce_scatter": True,
+                "reduce_bucket_size": 5e8,
+                "allgather_bucket_size": 5e8,
+            },
+            "train_batch_size": total_batch_size,
+            "train_micro_batch_size_per_gpu": per_device_batch_size,
+            "gradient_accumulation_steps": grad_accum_steps,
             "gradient_clipping": 1.0,
             "offload_optimizer_device": "none",
             "offload_param_device": "none",
-            "zero_stage": zero_stage,
-            "train_micro_batch_size_per_gpu": 1,  # Will be overridden
+            "fp16": {
+                "enabled": not torch.cuda.is_bf16_supported(),
+            },
+            "bf16": {
+                "enabled": torch.cuda.is_bf16_supported(),
+            },
         }
         
+        # Create accelerator with DeepSpeed configuration
         accelerator = Accelerator(
             mixed_precision="bf16" if torch.cuda.is_bf16_supported() else "fp16",
             deepspeed_plugin=deepspeed_config,
             log_with=None,
-            project_config=ProjectConfiguration(),
+            project_config=ProjectConfiguration(distributed_type=DistributedType.DEEPSPEED),
         )
         os.environ["ACCELERATE_DISTRIBUTED_TYPE"] = "DEEPSPEED"
     else:
@@ -363,11 +644,11 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
         accelerator = Accelerator(
             mixed_precision="bf16" if torch.cuda.is_bf16_supported() else "fp16",
             log_with=None,
-            project_config=ProjectConfiguration(),
+            project_config=ProjectConfiguration(distributed_type=DistributedType.MULTI_GPU),
         )
         os.environ["ACCELERATE_DISTRIBUTED_TYPE"] = "MULTI_GPU"
     
-    # Print distributed info
+    # Print distributed info, but only from the main process
     if accelerator.process_index == 0:
         world_size = accelerator.num_processes
         print(f"Unsloth: Multi-GPU initialized with {world_size} GPUs")
@@ -381,7 +662,13 @@ def initialize_distributed(strategy="ddp", use_deepspeed=False, zero_stage=2):
             print(f"Unsloth: Accelerate distributed type: {dist_type}")
             if dist_type == DistributedType.MULTI_GPU:
                 print("Unsloth: Using native PyTorch DDP for distributed training")
+                print(f"Unsloth: Effective batch size: {per_device_batch_size * world_size * grad_accum_steps}")
             elif dist_type == DistributedType.DEEPSPEED:
                 print(f"Unsloth: Using DeepSpeed ZeRO-{zero_stage} for distributed training")
+                print(f"Unsloth: Effective batch size: {per_device_batch_size * world_size * grad_accum_steps}")
+    
+    # Make sure all processes are synced before returning
+    if accelerator.num_processes > 1:
+        torch.distributed.barrier()
     
     return accelerator

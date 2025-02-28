@@ -68,6 +68,35 @@ pass
 # Log Unsloth is being used
 os.environ["UNSLOTH_IS_PRESENT"] = "1"
 
+# Detect if we're in a distributed environment
+# This check needs to happen before any imports
+import sys
+is_distributed = False
+local_rank = 0
+
+# Check common distributed environment variables
+if "LOCAL_RANK" in os.environ:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    is_distributed = True
+elif "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    is_distributed = True
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+
+# Only allow the main process to print initialization messages
+# to avoid duplicate messages across processes
+if is_distributed and local_rank != 0:
+    # Suppress standard output for non-main processes
+    # Save original stdout/stderr for later restoration if needed
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    class DummyStream:
+        def write(self, x): pass
+        def flush(self): pass
+    sys.stdout = DummyStream()
+    
+    # We'll restore this after key initialization is complete
+    # (see bottom of this file)
+
 try:
     import torch
 except ModuleNotFoundError:
@@ -224,3 +253,9 @@ from .trainer import initialize_distributed
 
 # Patch TRL trainers for backwards compatibility
 _patch_trl_trainer()
+
+# Restore stdout/stderr for non-main processes after initialization
+if is_distributed and local_rank != 0 and 'original_stdout' in globals():
+    # Restore stdout but keep most initialization messages suppressed
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
